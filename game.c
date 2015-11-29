@@ -7,51 +7,10 @@
 #include "splash.h"
 #include "game.h"
 #include "ai.h"
-
-#define PADDLE_SIZE 6
-#define PADDLE_SPEED 0.001
-#define GAME_SPEED 1000 // one timer tick per x microseconds
-
-#define BALL_SPEED 0.0007
-#define BALL_START_ANGLE (M_PI/2 + M_PI/8) //(M_PI/2) // 0 is down, pi/2 is right
-
-#define BOARD_W ((double)(1.0))
-#define BOARD_H ((double)(1.0))
-
-#define PADDLE_UP 1
-#define PADDLE_STATIONARY 0
-#define PADDLE_DOWN -1
-
-#define ftoi(x) (x >= 0 ? (int)(x+0.5) : (int)(x-0.5))
+#include "util.h"
+#include "constants.h"
 
 FILE *data;
-
-struct score_s {
-	int p1;
-	int p2;
-};
-
-struct paddle_player_s {
-	double pos;
-	int dir;
-};
-
-struct paddle_s {
-	struct paddle_player_s p1;
-	struct paddle_player_s p2;
-};
-
-struct velocity_s {
-	double x;
-	double y;
-};
-
-struct ball_s {
-	double x;
-	double y;
-	double angle;
-	struct velocity_s velocity;
-};
 
 struct paddle_s paddle;
 pthread_mutex_t paddle_mut = PTHREAD_MUTEX_INITIALIZER;
@@ -79,69 +38,29 @@ void setup() {
 	score.p2 = 0;
 }
 
-void draw_stats() {
-	char stats[100];
-	snprintf(stats, 100, "(%i)            (%i)", score.p1, score.p2);
-	mvprintw(0,col/2-strlen(stats)/2,stats);
-}
-
-int bound(int val, int lower, int upper) {
-	if (val < lower) {
-		return lower;
-	} else if (upper < val) {
-		return upper;
-	} else {
-		return val;
-	}
-}
-
-void draw_bar(double pos, int col) {
-	int y = ftoi((pos / BOARD_H) * row);
-	y = bound(y, PADDLE_SIZE/2, row - PADDLE_SIZE/2);
-
-	for(int i=-PADDLE_SIZE/2; i<PADDLE_SIZE/2; i++) {
-		mvprintw(y+i,col,"|");
-	}
-}
-
-void draw_paddles() {
-	pthread_mutex_lock(&paddle_mut);
-	draw_bar(paddle.p1.pos, 0);
-	draw_bar(paddle.p2.pos,col-1);
-	pthread_mutex_unlock(&paddle_mut);
-}
-
-void draw_ball() {
-	mvprintw(ball.y * row, ball.x * col,"@");
-}
-
-void draw_board() {
-	clear();
-	draw_stats();
-	draw_paddles();
-	draw_ball();
-	refresh();
-}
-
-double fbound(double val, double lower, double upper) {
-	if (val < lower) {
-		return lower;
-	} else if (upper < val) {
-		return upper;
-	} else {
-		return val;
-	}
-}
-
 void reverse_ball_direction() {
 	ball.angle += M_PI;
-	ball.angle = fmod(ball.angle, 2 * M_PI);
+	ball.angle = amod(ball.angle);
 }
 
+/* requires angle to be at most pi/2 away from ball.angle */
 void reflect_ball(double angle) {
+	ball.angle = amod(ball.angle);
+	angle = amod(angle);
 	double diff = angle - ball.angle;
+	//assert(amod(diff) < M_PI / 2);
 	ball.angle += 2 * diff;
+	ball.angle = amod(ball.angle);
 	reverse_ball_direction();
+	update_ball_velocity();
+}
+
+void bound_ball_angle(double low, double hi) {
+	ball.angle = amod(ball.angle);
+	/* if hi is closer to ball.angle than low, we want to use hi, even
+	 * if we must wrap around. Adding 2pi solves this. */
+	ball.angle = fbound(ball.angle + 2 * M_PI, low + 2 * M_PI, hi + 2 * M_PI);
+	ball.angle = amod(ball.angle);
 	update_ball_velocity();
 }
 
@@ -149,44 +68,88 @@ void update_ball_position() {
 	ball.x += ball.velocity.x;
 	ball.y += ball.velocity.y;
 
-	if (ball.y <= 0) {
+	if (ball.y < 0) {
 		reflect_ball(M_PI);
+		ball.y = 0;
 	}
-	if (1 <= ball.y) {
+	if (BOARD_W < ball.y) {
 		reflect_ball(0);
+		ball.y = BOARD_W;
 	}
 
 
-	if (ball.x <= 0) {
+	/*
+	 *              -* ----|
+	 *      h     /  |     |
+	 *         /     |     |
+	 *      /        |     |
+	 *   /      l    |
+	 * * ------------* -|  h
+	 *   \ --__      |  |
+	 *      \   \__ t|  d  |
+	 *         \    -* -|  |
+	 *      h     \  |     |
+	 *              -* ----|
+	 *
+	 *  t = theta angle to reflect ball against
+	 *  l = length from center of arc to paddle
+	 *  h = height of paddle normalized
+	 *  d = differece between ball.y and center of paddle
+	 */
+	if (ball.x < 0) {
 		pthread_mutex_lock(&paddle_mut);
 		double pad = paddle.p1.pos;
 		pthread_mutex_unlock(&paddle_mut);
-		double paddle_h = ((double)PADDLE_SIZE / 2 / (double)row);
-		double diff = pad - ball.y;
-		double dist = fabs(diff);
-		if (paddle_h <= dist) {
+		double h = ((double)PADDLE_SIZE / (double)row);
+		double l = (h / 2) / tan(M_PI / 6);
+		double d = ball.y - pad;
+		if (fabs(d) < h / 2) {
+			double angle = amod((d > 0 ? M_PI : 0) + atan(l/d));
+			double abs = angle_dist(angle, ball.angle);
+			log_init();
+			fprintf(log_file, "%f %f %f %f\n", d, angle, ball.angle, abs);
+			if (abs< M_PI / 2) {
+				reflect_ball(angle);
+				bound_ball_angle(MIN_BALL_ANGLE, M_PI - MIN_BALL_ANGLE);
+			}
+			else {
+				reflect_ball(3 * M_PI / 2);
+			}
+		}
+		else {
 			score.p2++;
 			reflect_ball(3 * M_PI / 2);
 		}
-		else {
-			reflect_ball(cos(diff/paddle_h));
-		}
+		ball.x = 0;
 	}
-	if (1 <= ball.x) {
+	if (BOARD_W < ball.x) {
 		pthread_mutex_lock(&paddle_mut);
 		double pad = paddle.p2.pos;
 		pthread_mutex_unlock(&paddle_mut);
-		double paddle_h = ((double)PADDLE_SIZE / 2 / (double)row);
-		double diff = pad - ball.y;
-		double dist = fabs(diff);
-		if (paddle_h < dist) {
+		double h = ((double)PADDLE_SIZE / (double)row);
+		double l = (h / 2) / tan(M_PI / 6);
+		double d = pad - ball.y;
+		if (fabs(d) < h / 2) {
+			double angle = amod((d < 0 ? M_PI : 0) + atan(l/d));
+			double abs = angle_dist(angle, ball.angle);
+			log_init();
+			fprintf(log_file, "%f %f %f %f\n", d, angle, ball.angle, abs);
+			if (abs < (M_PI / 2)) {
+				reflect_ball(angle);
+				bound_ball_angle(M_PI + MIN_BALL_ANGLE, 2 * M_PI - MIN_BALL_ANGLE);
+			}
+			else {
+				log_init();
+				double abs = angle_dist(angle, ball.angle);
+				fprintf(log_file, "%f %f %f %f\n", d, angle, ball.angle, abs);
+				reflect_ball(M_PI / 2);
+			}
+		}
+		else {
 			score.p1++;
 			reflect_ball(M_PI / 2);
 		}
-		else {
-			reflect_ball(sin(diff/paddle_h));
-		}
-
+		ball.x = BOARD_W;
 	}
 }
 
@@ -288,9 +251,8 @@ void* listen_keys() {
 void play_new_game() {
 	data = fopen("pong.data", "a");
 	setup();
-	draw_board();
+	draw_board(ball, score, paddle, col, row);
 	splash();
-	//draw_board();
 
 	pthread_t getkeys;
 	pthread_create(&getkeys, NULL, listen_keys, NULL);
@@ -298,7 +260,7 @@ void play_new_game() {
 	while (true) {
 		usleep(GAME_SPEED);
 		update_state();
-		draw_board();
+		draw_board(ball, score, paddle, col, row);
 	}
 
 }
