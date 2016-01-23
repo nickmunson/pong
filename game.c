@@ -157,7 +157,7 @@ void update_paddles() {
 	/* lock paddle */
 	pthread_mutex_lock(&paddle_mut);
 
-	switch (paddle.p1.dir) {
+	switch (make_move(paddle.p1.pos, paddle.p2.pos, ball.x, ball.y)) {
 		case PADDLE_UP:
 			paddle.p1.pos -= PADDLE_SPEED;
 			break;
